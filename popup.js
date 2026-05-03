@@ -23,7 +23,7 @@ function getViewState(state) {
       tone: "connected",
       label: "Connected",
       badge: "Online",
-      detail: "Bridge is active. URL and token are locked while connected.",
+      detail: "Bridge is running. URL and token are locked while connected.",
       buttonText: "Disconnect",
       inputsLocked: true,
     };
@@ -32,8 +32,8 @@ function getViewState(state) {
     return {
       tone: "connecting",
       label: "Connecting",
-      badge: "Syncing",
-      detail: "Opening a secure bridge to OpenAgent...",
+      badge: "Opening",
+      detail: "Opening websocket channel to the configured endpoint.",
       buttonText: "Disconnect",
       inputsLocked: true,
     };
@@ -43,7 +43,7 @@ function getViewState(state) {
       tone: "connecting",
       label: `Reconnecting (${state.reconnectAttempt})`,
       badge: "Retrying",
-      detail: "Connection dropped. The bridge is trying to recover automatically.",
+      detail: "Connection dropped. Trying to reconnect automatically.",
       buttonText: "Disconnect",
       inputsLocked: true,
     };
@@ -62,7 +62,7 @@ function getViewState(state) {
     tone: "idle",
     label: "Disconnected",
     badge: "Idle",
-    detail: "Ready to connect with Browser Use.",
+    detail: "Set the endpoint, then bring the bridge online.",
     buttonText: "Connect",
     inputsLocked: false,
   };
