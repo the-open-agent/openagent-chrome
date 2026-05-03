@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "OpenAgent Browser Bridge",
+  "description": "Allow OpenAgent Browser Use to operate the tabs you own in this Chrome profile.",
+  "version": "0.2.0",
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "scripting",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "OpenAgent Browser Bridge"
+  }
+}
