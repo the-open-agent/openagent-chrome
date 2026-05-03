@@ -3,6 +3,12 @@
   "name": "OpenAgent Browser Bridge",
   "description": "Allow OpenAgent Browser Use to operate the tabs you own in this Chrome profile.",
   "version": "0.2.0",
+  "homepage_url": "https://github.com/the-open-agent/openagent-chrome",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "activeTab",
     "alarms",
@@ -19,6 +25,11 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "OpenAgent Browser Bridge"
+    "default_title": "OpenAgent Browser Bridge",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   }
 }
