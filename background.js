@@ -1,9 +1,9 @@
-const BRIDGE_PATH = "/api/browser-use/casibase-browser-extension";
+const BRIDGE_PATH = "/api/chrome-connect";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:14000";
 const HEARTBEAT_MS = 20000;
 const PONG_TIMEOUT_MS = 45000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 30000];
-const KEEPALIVE_ALARM = "casibase-bridge-keepalive";
+const KEEPALIVE_ALARM = "openagent-bridge-keepalive";
 
 let socket = null;
 let heartbeatTimer = null;
@@ -626,7 +626,7 @@ async function getFrames(tabId) {
 async function sendContentMessage(tabId, frameId, command, payload) {
   const options = Number.isInteger(frameId) ? {frameId} : undefined;
   const message = {
-    type: "casibase-command",
+    type: "openagent-command",
     command,
     payload,
   };

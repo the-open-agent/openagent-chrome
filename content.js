@@ -1,13 +1,13 @@
 (() => {
-  if (window.__casibaseBrowserBridgeContentLoaded) {
+  if (window.__openAgentBrowserBridgeContentLoaded) {
     return;
   }
-  window.__casibaseBrowserBridgeContentLoaded = true;
+  window.__openAgentBrowserBridgeContentLoaded = true;
 
   const maxElements = 140;
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (!message || message.type !== "casibase-command") {
+    if (!message || message.type !== "openagent-command") {
       return false;
     }
     try {
@@ -44,8 +44,8 @@
 
   function snapshot(payload) {
     allElements(document).forEach((el) => {
-      if (el.hasAttribute("data-casibase-browser-ref")) {
-        el.removeAttribute("data-casibase-browser-ref");
+      if (el.hasAttribute("data-openagent-browser-ref")) {
+        el.removeAttribute("data-openagent-browser-ref");
       }
     });
 
@@ -238,7 +238,7 @@
   function serializeElement(el, index, payload) {
     const ref = String(index);
     const rect = el.getBoundingClientRect();
-    el.setAttribute("data-casibase-browser-ref", ref);
+    el.setAttribute("data-openagent-browser-ref", ref);
     const tag = tagName(el);
     return {
       index,
@@ -275,7 +275,7 @@
     const index = payload.index || payload.ref;
     if (index) {
       const escaped = cssEscape(String(index));
-      const byRef = findComposed(`[data-casibase-browser-ref="${escaped}"]`);
+      const byRef = findComposed(`[data-openagent-browser-ref="${escaped}"]`);
       if (byRef) {
         return byRef;
       }
