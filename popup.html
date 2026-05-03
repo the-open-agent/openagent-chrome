@@ -6,22 +6,46 @@
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <main>
-    <h1>OpenAgent Browser Bridge</h1>
-    <label>
-      OpenAgent URL
-      <input id="serverUrl" type="text" placeholder="http://127.0.0.1:14000">
-    </label>
-    <label>
-      Token
-      <input id="token" type="password" placeholder="Optional">
-    </label>
-    <div id="status" class="status">Disconnected</div>
-    <div class="actions">
-      <button id="connect" type="button">Connect</button>
-      <button id="disconnect" type="button">Disconnect</button>
-    </div>
-    <p class="hint">Connect this extension, then select OpenAgent Chrome Extension mode in Browser Use.</p>
+  <main class="shell">
+    <section class="hero">
+      <div class="brand-mark" aria-hidden="true">
+        <img src="icons/icon128.png" alt="">
+      </div>
+      <div>
+        <p class="eyebrow">Chrome Extension</p>
+        <h1>OpenAgent Bridge</h1>
+      </div>
+    </section>
+
+    <section id="statusCard" class="status-card" aria-live="polite">
+      <div class="status-row">
+        <div class="status-copy">
+          <span id="statusDot" class="status-dot"></span>
+          <div>
+            <p id="statusLabel" class="status-label">Disconnected</p>
+            <p id="statusDetail" class="status-detail">Ready to connect with Browser Use.</p>
+          </div>
+        </div>
+        <span id="statusBadge" class="badge">Idle</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <label class="field">
+        <span class="field-label">OpenAgent URL</span>
+        <input id="serverUrl" type="text" placeholder="http://127.0.0.1:14000" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">
+        <span class="field-label">Token</span>
+        <input id="token" type="password" placeholder="Optional" autocomplete="current-password">
+      </label>
+    </section>
+
+    <button id="connectionToggle" class="primary-action" type="button">
+      Connect
+    </button>
+
+    <p class="hint">Connect this extension, then select <strong>OpenAgent Chrome Extension</strong> mode in Browser Use.</p>
   </main>
   <script src="popup.js"></script>
 </body>
