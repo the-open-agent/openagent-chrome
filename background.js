@@ -402,12 +402,15 @@ async function clearControlledTab(tabId) {
   }
 }
 
-async function ensureControlledTab() {
+async function ensureControlledTab(url) {
   const existing = await getControlledTab();
   if (existing) {
     return existing;
   }
-  const createProperties = {active: true};
+  const createProperties = {active: false};
+  if (url) {
+    createProperties.url = url;
+  }
   const tab = await callbackApi((cb) => chrome.tabs.create(createProperties, cb));
   if (!tab || !tab.id) {
     throw new Error("Chrome did not create a Browser Use controlled tab");
@@ -524,8 +527,10 @@ async function openUrl(payload) {
     throw new Error("OpenAgent control tab is protected; Browser Use will open or switch to a separate controlled tab.");
   }
 
-  const controlled = await ensureControlledTab();
-  const tab = await callbackApi((cb) => chrome.tabs.update(controlled.id, {url, active: true}, cb));
+  const controlled = await getControlledTab();
+  const tab = controlled
+    ? await callbackApi((cb) => chrome.tabs.update(controlled.id, {url}, cb))
+    : await ensureControlledTab(url);
   await setControlledTab(tab);
   if (!tab || !tab.id) {
     throw new Error("Chrome did not return a tab for navigation");
