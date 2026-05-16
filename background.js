@@ -4,6 +4,11 @@ const HEARTBEAT_MS = 20000;
 const PONG_TIMEOUT_MS = 45000;
 const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 30000];
 const KEEPALIVE_ALARM = "openagent-bridge-keepalive";
+const DEBUGGER_PROTOCOL_VERSION = "1.3";
+const MAX_SNAPSHOT_ELEMENTS = 180;
+const MAX_CDP_ELEMENTS = 60;
+const MAX_AX_LINES = 120;
+const MAX_DOM_TEXT_CHARS = 4000;
 
 let socket = null;
 let heartbeatTimer = null;
@@ -345,6 +350,10 @@ async function executeCommand(command, payload) {
     return snapshotTab(await getControlledTabId(), payload);
   case "click":
     return runTargetedCommand(await getControlledTabId(), "click", payload);
+  case "resolveClickPoint":
+    return resolveClickPoint(await getControlledTabId(), payload);
+  case "afterNativeClick":
+    return afterNativeClick(payload);
   case "type":
     return runTargetedCommand(await getControlledTabId(), "type", payload);
   case "press":
@@ -617,15 +626,11 @@ async function ensureContentScript(tabId, allFrames) {
 }
 
 async function getFrames(tabId) {
-  try {
-    const frames = await callbackApi((cb) => chrome.webNavigation.getAllFrames({tabId}, cb));
-    if (frames && frames.length > 0) {
-      return frames.sort((a, b) => a.frameId - b.frameId);
-    }
-  } catch (error) {
-    // webNavigation is best-effort; fall back to the main frame.
+  const frames = await callbackApi((cb) => chrome.webNavigation.getAllFrames({tabId}, cb));
+  if (frames && frames.length > 0) {
+    return frames.sort((a, b) => a.frameId - b.frameId);
   }
-  return [{frameId: 0, url: ""}];
+  throw new Error(`Chrome did not return any frames for tab ${tabId}`);
 }
 
 async function sendContentMessage(tabId, frameId, command, payload) {
@@ -649,66 +654,109 @@ async function sendContentMessage(tabId, frameId, command, payload) {
 }
 
 async function snapshotTab(tabId, payload) {
-  try {
-    await ensureContentScript(tabId, true);
-  } catch (error) {
-    await ensureContentScript(tabId, false);
-  }
+  const contentSnapshot = await collectContentSnapshot(tabId, payload);
+  const cdpSnapshot = await collectCdpSnapshot(tabId);
+  return normalizeSnapshot(tabId, contentSnapshot, cdpSnapshot);
+}
+
+async function collectContentSnapshot(tabId, payload) {
+  await ensureContentScript(tabId, true);
   const tab = await callbackApi((cb) => chrome.tabs.get(tabId, cb));
   const frames = await getFrames(tabId);
   const frameResults = [];
   for (const frame of frames) {
-    try {
-      const result = await sendContentMessage(tabId, frame.frameId, "snapshot", {
-        ...payload,
-        frameId: frame.frameId,
-        frameUrl: frame.url || "",
-      });
-      if (result) {
-        frameResults.push({frame, result});
-      }
-    } catch (error) {
-      if (frame.frameId === 0) {
-        throw error;
-      }
-      frameResults.push({
-        frame,
-        result: {
-          url: frame.url || "",
-          title: "",
-          visibleText: "",
-          mediaState: "",
-          elements: [],
-          warning: error.message || String(error),
-        },
-      });
+    const result = await sendContentMessage(tabId, frame.frameId, "snapshot", {
+      ...payload,
+      frameId: frame.frameId,
+      frameUrl: frame.url || "",
+    });
+    if (result) {
+      frameResults.push({frame, result});
     }
   }
+  return {tab, frames, frameResults};
+}
 
+async function collectCdpSnapshot(tabId) {
+  if (!chrome.debugger) {
+    throw new Error("Chrome debugger API is unavailable; reload the extension after granting the debugger permission.");
+  }
+  await debuggerAttach(tabId);
+  try {
+    const frameTree = await debuggerSendCommand(tabId, "Page.getFrameTree", {});
+    const frameIds = flattenCdpFrameTree(frameTree && frameTree.frameTree).map((frame) => frame.id).filter(Boolean);
+    const axTrees = [];
+    for (const frameId of frameIds) {
+      const axTree = await debuggerSendCommand(tabId, "Accessibility.getFullAXTree", {frameId});
+      axTrees.push({frameId, nodes: axTree && Array.isArray(axTree.nodes) ? axTree.nodes : []});
+    }
+    const domSnapshot = await debuggerSendCommand(tabId, "DOMSnapshot.captureSnapshot", {
+      includePaintOrder: true,
+      includeDOMRects: true,
+      includeBlendedBackgroundColors: false,
+      includeTextColorOpacities: false,
+    });
+    const runtimeState = await evaluateCdpRuntimeState(tabId);
+    return {frameTree, frameIds, axTrees, domSnapshot, runtimeState};
+  } finally {
+    await debuggerDetach(tabId);
+  }
+}
+
+async function debuggerAttach(tabId) {
+  await callbackApi((cb) => chrome.debugger.attach({tabId}, DEBUGGER_PROTOCOL_VERSION, cb));
+}
+
+async function debuggerDetach(tabId) {
+  await callbackApi((cb) => chrome.debugger.detach({tabId}, cb)).catch(() => {});
+}
+
+async function debuggerSendCommand(tabId, method, params) {
+  return callbackApi((cb) => chrome.debugger.sendCommand({tabId}, method, params || {}, cb));
+}
+
+async function evaluateCdpRuntimeState(tabId) {
+  const result = await debuggerSendCommand(tabId, "Runtime.evaluate", {
+    expression: cdpRuntimeStateExpression(),
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (result && result.exceptionDetails) {
+    const description = result.exceptionDetails.text ||
+      result.exceptionDetails.exception && result.exceptionDetails.exception.description ||
+      "Runtime.evaluate failed";
+    throw new Error(description);
+  }
+  return result && result.result ? result.result.value || null : null;
+}
+
+function flattenCdpFrameTree(frameTree) {
+  if (!frameTree || !frameTree.frame) {
+    return [];
+  }
+  const frames = [frameTree.frame];
+  for (const child of frameTree.childFrames || []) {
+    frames.push(...flattenCdpFrameTree(child));
+  }
+  return frames;
+}
+
+function normalizeSnapshot(tabId, contentSnapshot, cdpSnapshot) {
+  const {tab, frameResults} = contentSnapshot;
   const main = frameResults.find((item) => item.frame.frameId === 0) || frameResults[0] || {};
+  const contentElements = collectContentElements(frameResults);
+  const cdpDetails = normalizeCdpSnapshot(cdpSnapshot);
+  const merged = mergeSnapshotElements(contentElements, cdpDetails.elements);
   const elements = [];
   const indexMap = new Map();
   let nextIndex = 1;
-  for (const item of frameResults) {
-    const result = item.result || {};
-    for (const element of result.elements || []) {
-      if (nextIndex > 180) {
-        break;
-      }
-      const global = {
-        ...element,
-        index: nextIndex,
-        ref: element.ref || String(element.index || nextIndex),
-        frameId: item.frame.frameId,
-        frameUrl: item.frame.url || result.url || "",
-      };
-      elements.push(global);
-      indexMap.set(nextIndex, {
-        frameId: item.frame.frameId,
-        ref: global.ref,
-      });
-      nextIndex += 1;
+  for (const item of merged) {
+    if (nextIndex > MAX_SNAPSHOT_ELEMENTS) {
+      break;
     }
+    elements.push({...item.element, index: nextIndex});
+    indexMap.set(nextIndex, item.target);
+    nextIndex += 1;
   }
   snapshotTargetsByTab.set(tabId, indexMap);
 
@@ -725,16 +773,537 @@ async function snapshotTab(tabId, payload) {
       visibleTextParts.push(`[frame ${item.frame.frameId} ${item.frame.url || ""}]\n${text}`);
     }
   }
+  const semanticText = formatSemanticText(contentSnapshot, cdpDetails);
+  if (semanticText) {
+    visibleTextParts.push(semanticText);
+  }
 
   return {
     tab: normalizeTab(tab, Boolean(tab.active), true),
     url: main.result && main.result.url ? main.result.url : tab.url || "",
     title: main.result && main.result.title ? main.result.title : tab.title || "",
-    visibleText: visibleTextParts.join("\n\n").slice(0, 8000),
+    visibleText: visibleTextParts.join("\n\n").slice(0, 16000),
     mediaState: main.result && main.result.mediaState ? main.result.mediaState : "none",
     elements,
     frameCount: frameResults.length,
   };
+}
+
+function collectContentElements(frameResults) {
+  const items = [];
+  for (const item of frameResults) {
+    const result = item.result || {};
+    for (const element of result.elements || []) {
+      const ref = element.ref || String(element.index || "");
+      if (!ref) {
+        continue;
+      }
+      items.push({
+        element: {
+          ...element,
+          index: 0,
+          ref,
+          frameId: item.frame.frameId,
+          frameUrl: item.frame.url || result.url || "",
+        },
+        target: {
+          frameId: item.frame.frameId,
+          ref,
+        },
+      });
+    }
+  }
+  return items;
+}
+
+function mergeSnapshotElements(contentElements, cdpElements) {
+  const merged = [];
+  const seen = new Set();
+  for (const item of [...contentElements, ...cdpElements]) {
+    const key = elementDedupeKey(item.element);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function elementDedupeKey(element) {
+  const text = normalizeInlineText(element.text || element.ariaLabel || element.placeholder || element.value || "").slice(0, 80);
+  return [
+    element.frameId || 0,
+    element.tag || "",
+    element.role || "",
+    text,
+    Math.round(Number(element.x || 0) / 4) * 4,
+    Math.round(Number(element.y || 0) / 4) * 4,
+    Math.round(Number(element.width || 0) / 4) * 4,
+    Math.round(Number(element.height || 0) / 4) * 4,
+  ].join("|");
+}
+
+function normalizeCdpSnapshot(cdpSnapshot) {
+  const domIndex = buildDomSnapshotIndex(cdpSnapshot.domSnapshot);
+  const axSummary = buildAxSummary(cdpSnapshot.axTrees, domIndex);
+  return {
+    runtimeState: cdpSnapshot.runtimeState || {},
+    axLines: axSummary.lines,
+    domText: domIndex.textSummary,
+    elements: axSummary.elements,
+  };
+}
+
+function buildDomSnapshotIndex(domSnapshot) {
+  const strings = Array.isArray(domSnapshot && domSnapshot.strings) ? domSnapshot.strings : [];
+  const documents = Array.isArray(domSnapshot && domSnapshot.documents) ? domSnapshot.documents : [];
+  const backendToNode = new Map();
+  const textParts = [];
+
+  for (let docIndex = 0; docIndex < documents.length; docIndex += 1) {
+    const doc = documents[docIndex] || {};
+    const nodes = doc.nodes || {};
+    const layout = doc.layout || {};
+    const layoutByNodeIndex = buildLayoutIndex(layout);
+    const docNodes = [];
+    const nodeCount = Array.isArray(nodes.nodeType) ? nodes.nodeType.length : 0;
+    for (let index = 0; index < nodeCount; index += 1) {
+      const layoutIndex = layoutByNodeIndex.get(index);
+      const attrs = parseSnapshotAttributes(strings, nodes.attributes && nodes.attributes[index]);
+      const node = {
+        docIndex,
+        index,
+        nodeType: Number(nodes.nodeType[index] || 0),
+        nodeName: snapshotString(strings, nodes.nodeName && nodes.nodeName[index]),
+        nodeValue: snapshotString(strings, nodes.nodeValue && nodes.nodeValue[index]),
+        backendNodeId: Number(nodes.backendNodeId && nodes.backendNodeId[index] || 0),
+        parentIndex: Number.isInteger(nodes.parentIndex && nodes.parentIndex[index]) ? nodes.parentIndex[index] : -1,
+        attrs,
+        bounds: parseSnapshotBounds(layout, layoutIndex),
+        selector: "",
+      };
+      docNodes[index] = node;
+      if (node.backendNodeId) {
+        backendToNode.set(node.backendNodeId, node);
+      }
+    }
+    for (const node of docNodes) {
+      if (node && node.nodeType === 1) {
+        node.selector = buildCssPath(docNodes, node.index);
+      }
+      if (node && node.nodeType === 3 && node.nodeValue && isUsefulTextParent(docNodes[node.parentIndex])) {
+        textParts.push(node.nodeValue);
+      }
+    }
+  }
+
+  return {
+    backendToNode,
+    textSummary: compactUniqueText(textParts.join(" "), MAX_DOM_TEXT_CHARS),
+  };
+}
+
+function buildLayoutIndex(layout) {
+  const map = new Map();
+  for (let i = 0; i < (layout.nodeIndex || []).length; i += 1) {
+    if (!map.has(layout.nodeIndex[i])) {
+      map.set(layout.nodeIndex[i], i);
+    }
+  }
+  return map;
+}
+
+function parseSnapshotAttributes(strings, rawAttributes) {
+  const attrs = {};
+  if (!Array.isArray(rawAttributes)) {
+    return attrs;
+  }
+  for (let i = 0; i + 1 < rawAttributes.length; i += 2) {
+    const name = snapshotString(strings, rawAttributes[i]);
+    if (!name) {
+      continue;
+    }
+    attrs[name] = snapshotString(strings, rawAttributes[i + 1]);
+  }
+  return attrs;
+}
+
+function parseSnapshotBounds(layout, layoutIndex) {
+  if (!Number.isInteger(layoutIndex) || layoutIndex < 0 || !Array.isArray(layout.bounds) || !Array.isArray(layout.bounds[layoutIndex])) {
+    return null;
+  }
+  const bounds = layout.bounds[layoutIndex];
+  if (bounds.length < 4) {
+    return null;
+  }
+  return {
+    x: Math.round(Number(bounds[0] || 0)),
+    y: Math.round(Number(bounds[1] || 0)),
+    width: Math.round(Number(bounds[2] || 0)),
+    height: Math.round(Number(bounds[3] || 0)),
+  };
+}
+
+function snapshotString(strings, index) {
+  return Number.isInteger(index) && index >= 0 && index < strings.length ? String(strings[index] || "") : "";
+}
+
+function isUsefulTextParent(parent) {
+  if (!parent || parent.nodeType !== 1) {
+    return false;
+  }
+  const name = String(parent.nodeName || "").toLowerCase();
+  return !["script", "style", "noscript", "template", "svg"].includes(name);
+}
+
+function buildCssPath(docNodes, startIndex) {
+  const parts = [];
+  let index = startIndex;
+  while (Number.isInteger(index) && index >= 0) {
+    const node = docNodes[index];
+    if (!node || node.nodeType !== 1) {
+      break;
+    }
+    const tag = String(node.nodeName || "").toLowerCase();
+    if (!tag || tag === "html") {
+      break;
+    }
+    const id = node.attrs && node.attrs.id;
+    if (id) {
+      parts.unshift(`${tag}[id="${cssAttrLoose(id)}"]`);
+      break;
+    }
+    const nth = nthOfType(docNodes, node);
+    parts.unshift(nth > 1 ? `${tag}:nth-of-type(${nth})` : tag);
+    index = node.parentIndex;
+    if (parts.length >= 6) {
+      break;
+    }
+  }
+  return parts.length ? parts.join(" > ") : "";
+}
+
+function nthOfType(docNodes, node) {
+  let count = 0;
+  for (const candidate of docNodes) {
+    if (!candidate || candidate.parentIndex !== node.parentIndex || candidate.nodeType !== 1) {
+      continue;
+    }
+    if (String(candidate.nodeName || "").toLowerCase() !== String(node.nodeName || "").toLowerCase()) {
+      continue;
+    }
+    count += 1;
+    if (candidate.index === node.index) {
+      return count;
+    }
+  }
+  return 1;
+}
+
+function buildAxSummary(axTrees, domIndex) {
+  const lines = [];
+  const elements = [];
+  const seenElements = new Set();
+  for (const tree of axTrees || []) {
+    const nodes = Array.isArray(tree.nodes) ? tree.nodes : [];
+    for (const node of nodes) {
+      if (!node || node.ignored) {
+        continue;
+      }
+      const role = axValue(node.role);
+      const name = normalizeInlineText(axValue(node.name));
+      const value = normalizeInlineText(axValue(node.value));
+      const description = normalizeInlineText(axValue(node.description));
+      if (!role && !name && !value) {
+        continue;
+      }
+      if (lines.length < MAX_AX_LINES) {
+        lines.push(formatAxLine(role, name, value, description));
+      }
+      if (elements.length >= MAX_CDP_ELEMENTS || !isInteractiveAxRole(role)) {
+        continue;
+      }
+      const backendNodeId = Number(node.backendDOMNodeId || node.backendNodeId || 0);
+      const domNode = backendNodeId ? domIndex.backendToNode.get(backendNodeId) : null;
+      if (!domNode || domNode.docIndex !== 0 || !domNode.selector || !domNode.bounds || domNode.bounds.width <= 0 || domNode.bounds.height <= 0) {
+        continue;
+      }
+      const key = `${backendNodeId}|${role}|${name}|${value}`;
+      if (seenElements.has(key)) {
+        continue;
+      }
+      seenElements.add(key);
+      elements.push({
+        element: {
+          index: 0,
+          ref: `cdp-${backendNodeId}`,
+          frameId: 0,
+          frameUrl: "",
+          tag: String(domNode.nodeName || "").toLowerCase(),
+          text: name || value || description,
+          ariaLabel: domNode.attrs["aria-label"] || "",
+          placeholder: domNode.attrs.placeholder || "",
+          value: value || domNode.attrs.value || "",
+          options: [],
+          href: domNode.attrs.href || "",
+          role,
+          x: domNode.bounds.x,
+          y: domNode.bounds.y,
+          width: domNode.bounds.width,
+          height: domNode.bounds.height,
+        },
+        target: {
+          frameId: 0,
+          selector: domNode.selector,
+        },
+      });
+    }
+  }
+  return {lines, elements};
+}
+
+function axValue(raw) {
+  if (raw === null || raw === undefined) {
+    return "";
+  }
+  if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") {
+    return String(raw);
+  }
+  if (typeof raw === "object" && raw.value !== undefined && raw.value !== null) {
+    return String(raw.value);
+  }
+  return "";
+}
+
+function formatAxLine(role, name, value, description) {
+  let line = `- ${role || "node"}`;
+  if (name) {
+    line += ` "${name.slice(0, 160)}"`;
+  }
+  if (value && value !== name) {
+    line += ` value="${value.slice(0, 120)}"`;
+  }
+  if (description && description !== name && description !== value) {
+    line += ` description="${description.slice(0, 120)}"`;
+  }
+  return line;
+}
+
+function isInteractiveAxRole(role) {
+  return [
+    "button", "link", "menuitem", "option", "tab", "checkbox", "radio", "switch",
+    "textbox", "combobox", "searchbox", "slider", "spinbutton", "listbox",
+  ].includes(String(role || "").toLowerCase());
+}
+
+function formatSemanticText(contentSnapshot, cdpDetails) {
+  const lines = ["Enhanced semantic snapshot:"];
+  const runtime = cdpDetails.runtimeState || {};
+  lines.push(formatFocusBlock("CDP focus", runtime.focus));
+  lines.push(formatSelectionBlock("CDP selection", runtime.selection));
+  const contentStateLines = formatContentFrameStates(contentSnapshot.frameResults);
+  if (contentStateLines.length) {
+    lines.push("Content script frame states:");
+    lines.push(...contentStateLines);
+  }
+  if (cdpDetails.axLines.length) {
+    lines.push("Accessibility tree:");
+    lines.push(...cdpDetails.axLines);
+  }
+  if (cdpDetails.domText) {
+    lines.push("DOM text summary:");
+    lines.push(cdpDetails.domText);
+  }
+  return lines.filter(Boolean).join("\n");
+}
+
+function formatContentFrameStates(frameResults) {
+  const lines = [];
+  for (const item of frameResults || []) {
+    const state = item.result && item.result.pageState;
+    if (!state || (!state.focus || !state.focus.present) && (!state.selection || !state.selection.present)) {
+      continue;
+    }
+    const prefix = `[frame ${item.frame.frameId} ${item.frame.url || ""}]`;
+    lines.push(`${prefix} ${formatFocusInline(state.focus)} ${formatSelectionInline(state.selection)}`.trim());
+  }
+  return lines.slice(0, 20);
+}
+
+function formatFocusBlock(label, focus) {
+  if (!focus || !focus.present) {
+    return `${label}: none`;
+  }
+  return `${label}: ${formatFocusInline(focus)}`;
+}
+
+function formatSelectionBlock(label, selection) {
+  if (!selection || !selection.present) {
+    return `${label}: none`;
+  }
+  return `${label}: ${formatSelectionInline(selection)}`;
+}
+
+function formatFocusInline(focus) {
+  if (!focus || !focus.present) {
+    return "focus=none";
+  }
+  const parts = [
+    `focus=<${focus.tag || ""}>`,
+    focus.role ? `role=${focus.role}` : "",
+    focus.contenteditable ? "contenteditable=true" : "",
+    focus.text ? `text="${normalizeInlineText(focus.text).slice(0, 180)}"` : "",
+    focus.value ? `value="${normalizeInlineText(focus.value).slice(0, 120)}"` : "",
+    Number.isFinite(focus.x) ? `rect=(${focus.x},${focus.y},${focus.width},${focus.height})` : "",
+  ].filter(Boolean);
+  return parts.join(" ");
+}
+
+function formatSelectionInline(selection) {
+  if (!selection || !selection.present) {
+    return "selection=none";
+  }
+  const parts = [
+    `selection=${selection.collapsed ? "collapsed" : "range"}`,
+    selection.kind ? `kind=${selection.kind}` : "",
+    selection.text ? `text="${normalizeInlineText(selection.text).slice(0, 240)}"` : "",
+    Number.isInteger(selection.start) && Number.isInteger(selection.end) ? `range=${selection.start}-${selection.end}` : "",
+    Number.isFinite(selection.x) ? `rect=(${selection.x},${selection.y},${selection.width},${selection.height})` : "",
+  ].filter(Boolean);
+  return parts.join(" ");
+}
+
+function compactUniqueText(text, maxChars) {
+  const parts = normalizeInlineText(text).split(" ");
+  const out = [];
+  let last = "";
+  let length = 0;
+  for (const part of parts) {
+    if (!part || part === last) {
+      continue;
+    }
+    const nextLength = length + part.length + (out.length ? 1 : 0);
+    if (nextLength > maxChars) {
+      if (out.length === 0) {
+        out.push(part.slice(0, maxChars));
+      }
+      break;
+    }
+    out.push(part);
+    last = part;
+    length = nextLength;
+  }
+  return out.join(" ");
+}
+
+function normalizeInlineText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+function cssAttrLoose(value) {
+  return String(value || "").replace(/["\\]/g, "\\$&");
+}
+
+function cdpRuntimeStateExpression() {
+  return `(() => {
+    const normalizeText = (value, limit = 500) => String(value || "").replace(/\\s+/g, " ").trim().slice(0, limit);
+    const rectObject = (rect) => rect ? {
+      x: Math.round(rect.x || 0),
+      y: Math.round(rect.y || 0),
+      width: Math.round(rect.width || 0),
+      height: Math.round(rect.height || 0)
+    } : {};
+    const tagName = (el) => el && el.tagName ? el.tagName.toLowerCase() : "";
+    const deepActiveElement = (root) => {
+      let active = root && root.activeElement ? root.activeElement : null;
+      while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+        active = active.shadowRoot.activeElement;
+      }
+      return active;
+    };
+    const valueText = (el) => {
+      if (!el) return "";
+      const tag = tagName(el);
+      if (tag === "input") {
+        const type = (el.type || "text").toLowerCase();
+        if (["password", "file"].includes(type)) return "";
+      }
+      return typeof el.value === "string" ? el.value : "";
+    };
+    const accessibleText = (el) => {
+      if (!el) return "";
+      return normalizeText([
+        el.getAttribute && el.getAttribute("aria-label"),
+        el.getAttribute && el.getAttribute("title"),
+        el.getAttribute && el.getAttribute("placeholder"),
+        valueText(el),
+        el.innerText,
+        el.textContent
+      ].filter(Boolean).join(" "), 800);
+    };
+    const active = deepActiveElement(document);
+    const activeTag = tagName(active);
+    let focus = {present: false};
+    if (active && active !== document.body && active !== document.documentElement) {
+      const rect = active.getBoundingClientRect();
+      focus = {
+        present: true,
+        tag: activeTag,
+        role: active.getAttribute("role") || "",
+        text: accessibleText(active),
+        ariaLabel: active.getAttribute("aria-label") || "",
+        placeholder: active.getAttribute("placeholder") || "",
+        value: normalizeText(valueText(active), 500),
+        contenteditable: Boolean(active.isContentEditable || active.getAttribute("contenteditable") === "true"),
+        ...rectObject(rect)
+      };
+      if ((activeTag === "input" || activeTag === "textarea") && typeof active.value === "string") {
+        try {
+          focus.selectionStart = active.selectionStart;
+          focus.selectionEnd = active.selectionEnd;
+          focus.selectedText = active.value.slice(active.selectionStart || 0, active.selectionEnd || 0).slice(0, 500);
+        } catch (error) {}
+      }
+    }
+    let selection = {present: false};
+    if (active && (activeTag === "input" || activeTag === "textarea") && typeof active.value === "string") {
+      try {
+        const start = active.selectionStart || 0;
+        const end = active.selectionEnd || start;
+        selection = {
+          present: true,
+          kind: activeTag,
+          collapsed: start === end,
+          text: active.value.slice(start, end).slice(0, 1000),
+          start,
+          end
+        };
+      } catch (error) {}
+    }
+    if (!selection.present && window.getSelection) {
+      const sel = window.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        selection = {
+          present: true,
+          kind: "range",
+          collapsed: sel.isCollapsed,
+          text: sel.toString().slice(0, 1000),
+          anchorText: normalizeText(sel.anchorNode && (sel.anchorNode.nodeValue || sel.anchorNode.textContent), 240),
+          focusText: normalizeText(sel.focusNode && (sel.focusNode.nodeValue || sel.focusNode.textContent), 240),
+          ...rectObject(range.getBoundingClientRect())
+        };
+      }
+    }
+    return {
+      url: location.href,
+      title: document.title,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      focus,
+      selection
+    };
+  })()`;
 }
 
 async function runTargetedCommand(tabId, command, payload) {
@@ -747,7 +1316,12 @@ async function runTargetedCommand(tabId, command, payload) {
   const target = resolveSnapshotTarget(tabId, payload);
   const framedPayload = {...payload};
   if (target) {
-    framedPayload.ref = target.ref;
+    if (target.selector) {
+      framedPayload.selector = target.selector;
+      delete framedPayload.ref;
+    } else {
+      framedPayload.ref = target.ref;
+    }
     delete framedPayload.index;
   }
 
@@ -787,6 +1361,83 @@ async function runTargetedCommand(tabId, command, payload) {
     }
     throw firstError;
   }
+}
+
+async function resolveClickPoint(tabId, payload) {
+  await ensureContentScript(tabId, false);
+  const target = resolveSnapshotTarget(tabId, payload);
+  if (target && target.frameId !== 0) {
+    throw new Error("Native click currently supports main-frame elements only. Use browser_use_click without OPENAGENT_BROWSER_USE_NATIVE_CLICK for iframe targets.");
+  }
+
+  const tab = await callbackApi((cb) => chrome.tabs.update(tabId, {active: true}, cb));
+  if (tab.windowId) {
+    await callbackApi((cb) => chrome.windows.update(tab.windowId, {focused: true}, cb));
+  }
+  await sleep(120);
+
+  const framedPayload = {...payload};
+  if (target) {
+    if (target.selector) {
+      framedPayload.selector = target.selector;
+      delete framedPayload.ref;
+    } else {
+      framedPayload.ref = target.ref;
+    }
+    delete framedPayload.index;
+  }
+  const point = await sendContentMessage(tabId, 0, "resolveClickPoint", framedPayload);
+  return {
+    ...point,
+    tabId,
+    windowId: tab.windowId || 0,
+  };
+}
+
+async function afterNativeClick(payload) {
+  const originalTabId = normalizeTabId(payload && payload.tabId);
+  if (originalTabId) {
+    await settleTab(originalTabId).catch(() => {});
+  }
+  await sleep(350);
+
+  const activeTab = await getActiveNonProtectedTab(Number(payload && payload.windowId) || 0);
+  if (activeTab) {
+    await settleTab(activeTab.id).catch(() => {});
+    const updated = await callbackApi((cb) => chrome.tabs.get(activeTab.id, cb)).catch(() => activeTab);
+    await setControlledTab(updated);
+    return {tab: normalizeTab(updated, true, true)};
+  }
+
+  const controlled = await getControlledTab();
+  if (controlled) {
+    return {tab: normalizeTab(controlled, Boolean(controlled.active), true)};
+  }
+  return {ok: true};
+}
+
+async function getActiveNonProtectedTab(preferredWindowId) {
+  const windows = await callbackApi((cb) => chrome.windows.getAll({populate: true}, cb));
+  const ordered = [...windows].sort((a, b) => {
+    if (preferredWindowId && a.id === preferredWindowId) {
+      return -1;
+    }
+    if (preferredWindowId && b.id === preferredWindowId) {
+      return 1;
+    }
+    return Number(Boolean(b.focused)) - Number(Boolean(a.focused));
+  });
+  for (const win of ordered) {
+    const active = (win.tabs || []).find((tab) => tab.active && !isProtectedTab(tab));
+    if (active) {
+      return active;
+    }
+  }
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function resolveSnapshotTarget(tabId, payload) {

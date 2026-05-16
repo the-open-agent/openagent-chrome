@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "OpenAgent Browser Bridge",
   "description": "Allow OpenAgent Browser Use to operate the tabs you own in this Chrome profile.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "homepage_url": "https://github.com/the-open-agent/openagent-chrome",
   "icons": {
     "16": "icons/icon16.png",
@@ -12,6 +12,7 @@
   "permissions": [
     "activeTab",
     "alarms",
+    "debugger",
     "scripting",
     "storage",
     "tabs",
