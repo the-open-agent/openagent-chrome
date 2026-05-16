@@ -626,11 +626,16 @@ async function ensureContentScript(tabId, allFrames) {
 }
 
 async function getFrames(tabId) {
-  const frames = await callbackApi((cb) => chrome.webNavigation.getAllFrames({tabId}, cb));
-  if (frames && frames.length > 0) {
-    return frames.sort((a, b) => a.frameId - b.frameId);
+  try {
+    const frames = await callbackApi((cb) => chrome.webNavigation.getAllFrames({tabId}, cb));
+    if (frames && frames.length > 0) {
+      return frames.sort((a, b) => a.frameId - b.frameId);
+    }
+  } catch (error) {
+    // webNavigation is best-effort; fall back to the main frame.
+    console.warn(`getFrames failed for tab ${tabId}: ${error.message}`);
   }
-  throw new Error(`Chrome did not return any frames for tab ${tabId}`);
+  return [{frameId: 0, url: ""}];
 }
 
 async function sendContentMessage(tabId, frameId, command, payload) {
@@ -679,9 +684,13 @@ async function collectContentSnapshot(tabId, payload) {
 
 async function collectCdpSnapshot(tabId) {
   if (!chrome.debugger) {
-    throw new Error("Chrome debugger API is unavailable; reload the extension after granting the debugger permission.");
+    console.warn("Chrome debugger API is unavailable; reload the extension after granting the debugger permission.");
+    return null;
   }
-  await debuggerAttach(tabId);
+  const attached = await debuggerAttach(tabId);
+  if (!attached) {
+    return null;
+  }
   try {
     const frameTree = await debuggerSendCommand(tabId, "Page.getFrameTree", {});
     const frameIds = flattenCdpFrameTree(frameTree && frameTree.frameTree).map((frame) => frame.id).filter(Boolean);
@@ -704,7 +713,14 @@ async function collectCdpSnapshot(tabId) {
 }
 
 async function debuggerAttach(tabId) {
-  await callbackApi((cb) => chrome.debugger.attach({tabId}, DEBUGGER_PROTOCOL_VERSION, cb));
+  try {
+    await callbackApi((cb) => chrome.debugger.attach({tabId}, DEBUGGER_PROTOCOL_VERSION, cb));
+    return true;
+  } catch (error) {
+    // DevTools or another debugger is already attached; skip CDP for this snapshot.
+    console.warn(`debuggerAttach failed for tab ${tabId}: ${error.message}`);
+    return false;
+  }
 }
 
 async function debuggerDetach(tabId) {
@@ -845,6 +861,9 @@ function elementDedupeKey(element) {
 }
 
 function normalizeCdpSnapshot(cdpSnapshot) {
+  if (!cdpSnapshot) {
+    return {runtimeState: {}, axLines: [], domText: "", elements: []};
+  }
   const domIndex = buildDomSnapshotIndex(cdpSnapshot.domSnapshot);
   const axSummary = buildAxSummary(cdpSnapshot.axTrees, domIndex);
   return {
