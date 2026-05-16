@@ -29,6 +29,8 @@
       return snapshot(payload);
     case "click":
       return clickElement(payload);
+    case "resolveClickPoint":
+      return resolveClickPoint(payload);
     case "type":
       return typeIntoElement(payload);
     case "press":
@@ -67,6 +69,7 @@
       url: window.location.href,
       title: document.title,
       visibleText,
+      pageState: collectPageState(),
       mediaState: mediaState(),
       elements,
     };
@@ -262,6 +265,109 @@
     };
   }
 
+  function collectPageState() {
+    return {
+      focus: serializeFocusedElement(),
+      selection: serializeSelection(),
+    };
+  }
+
+  function serializeFocusedElement() {
+    const el = deepActiveElement(document);
+    if (!el || el === document.body || el === document.documentElement) {
+      return {present: false};
+    }
+    const tag = tagName(el);
+    const rect = el.getBoundingClientRect();
+    const value = valueText(el);
+    const state = {
+      present: true,
+      tag,
+      role: el.getAttribute("role") || "",
+      text: accessibleText(el).slice(0, 240),
+      ariaLabel: el.getAttribute("aria-label") || "",
+      placeholder: el.getAttribute("placeholder") || "",
+      value,
+      contenteditable: Boolean(el.isContentEditable || el.getAttribute("contenteditable") === "true"),
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+    if (tag === "input" || tag === "textarea") {
+      const range = inputSelectionRange(el);
+      state.selectionStart = range ? range.start : null;
+      state.selectionEnd = range ? range.end : null;
+      if (state.selectionStart !== null && state.selectionEnd !== null && typeof el.value === "string") {
+        state.selectedText = el.value.slice(state.selectionStart, state.selectionEnd).slice(0, 500);
+      }
+    }
+    return state;
+  }
+
+  function deepActiveElement(root) {
+    let active = root && root.activeElement ? root.activeElement : null;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement) {
+      active = active.shadowRoot.activeElement;
+    }
+    return active;
+  }
+
+  function serializeSelection() {
+    const active = deepActiveElement(document);
+    const tag = tagName(active);
+    if ((tag === "input" || tag === "textarea") && typeof active.value === "string") {
+      const range = inputSelectionRange(active) || {start: 0, end: 0};
+      const start = range.start;
+      const end = range.end;
+      return {
+        present: true,
+        kind: tag,
+        collapsed: start === end,
+        text: active.value.slice(start, end).slice(0, 1000),
+        start,
+        end,
+      };
+    }
+
+    const selection = window.getSelection ? window.getSelection() : null;
+    if (!selection || selection.rangeCount === 0) {
+      return {present: false};
+    }
+    const range = selection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    return {
+      present: true,
+      kind: "range",
+      collapsed: selection.isCollapsed,
+      text: selection.toString().slice(0, 1000),
+      anchorText: nodeText(selection.anchorNode).slice(0, 240),
+      focusText: nodeText(selection.focusNode).slice(0, 240),
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+  }
+
+  function inputSelectionRange(el) {
+    try {
+      if (!el || !Number.isInteger(el.selectionStart) || !Number.isInteger(el.selectionEnd)) {
+        return null;
+      }
+      return {start: el.selectionStart, end: el.selectionEnd};
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function nodeText(node) {
+    if (!node) {
+      return "";
+    }
+    return (node.nodeValue || node.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
   function resolveTarget(payload) {
     if (payload.selector) {
       const selector = String(payload.selector);
@@ -329,6 +435,56 @@
 
   function cssAttr(value) {
     return String(value).replace(/["\\]/g, "\\$&");
+  }
+
+  async function resolveClickPoint(payload) {
+    const el = resolveTarget(payload);
+    el.scrollIntoView({block: "center", inline: "center"});
+    await sleep(80);
+
+    const rect = el.getBoundingClientRect();
+    const clientX = Number.isFinite(payload.x) ? payload.x : Math.round(rect.left + rect.width / 2);
+    const clientY = Number.isFinite(payload.y) ? payload.y : Math.round(rect.top + rect.height / 2);
+    const origin = viewportScreenOrigin();
+    return {
+      x: Math.round(origin.x + clientX),
+      y: Math.round(origin.y + clientY),
+      button: normalizeMouseButton(payload.button),
+      frameId: Number.isInteger(payload.frameId) ? payload.frameId : 0,
+      tag: tagName(el),
+      text: accessibleText(el).slice(0, 120),
+      clientX,
+      clientY,
+      viewportX: origin.x,
+      viewportY: origin.y,
+      screenX: Math.round(window.screenX || window.screenLeft || 0),
+      screenY: Math.round(window.screenY || window.screenTop || 0),
+      outerWidth: Math.round(window.outerWidth || 0),
+      outerHeight: Math.round(window.outerHeight || 0),
+      innerWidth: Math.round(window.innerWidth || 0),
+      innerHeight: Math.round(window.innerHeight || 0),
+      devicePixelRatio: window.devicePixelRatio || 1,
+    };
+  }
+
+  function viewportScreenOrigin() {
+    const screenX = window.screenX || window.screenLeft || 0;
+    const screenY = window.screenY || window.screenTop || 0;
+    const horizontalChrome = Math.max(0, (window.outerWidth || 0) - (window.innerWidth || 0));
+    const verticalChrome = Math.max(0, (window.outerHeight || 0) - (window.innerHeight || 0));
+    const sideBorder = Math.round(horizontalChrome / 2);
+    return {
+      x: Math.round(screenX + sideBorder),
+      y: Math.round(screenY + Math.max(0, verticalChrome - sideBorder)),
+    };
+  }
+
+  function normalizeMouseButton(button) {
+    const value = String(button || "left").trim().toLowerCase();
+    if (value === "right" || value === "middle" || value === "center") {
+      return value === "center" ? "middle" : value;
+    }
+    return "left";
   }
 
   async function clickElement(payload) {
