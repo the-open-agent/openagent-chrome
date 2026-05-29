@@ -625,6 +625,21 @@ async function ensureContentScript(tabId, allFrames) {
   }, cb));
 }
 
+function isMainFrame(frameId) {
+  return !Number.isInteger(frameId) || frameId === 0;
+}
+
+async function ensureContentScriptInFrame(tabId, frameId) {
+  if (isMainFrame(frameId)) {
+    await ensureContentScript(tabId, false);
+    return;
+  }
+  await callbackApi((cb) => chrome.scripting.executeScript({
+    target: {tabId, frameIds: [frameId]},
+    files: ["content.js"],
+  }, cb));
+}
+
 async function getFrames(tabId) {
   try {
     const frames = await callbackApi((cb) => chrome.webNavigation.getAllFrames({tabId}, cb));
@@ -633,7 +648,7 @@ async function getFrames(tabId) {
     }
   } catch (error) {
     // webNavigation is best-effort; fall back to the main frame.
-    console.warn(`getFrames failed for tab ${tabId}: ${error.message}`);
+    console.warn(`getFrames failed for tab ${tabId}: ${errorMessage(error)}`);
   }
   return [{frameId: 0, url: ""}];
 }
@@ -658,6 +673,37 @@ async function sendContentMessage(tabId, frameId, command, payload) {
   return response;
 }
 
+function isMissingContentReceiverError(error) {
+  if (!error) {
+    return false;
+  }
+  if (/Receiving end does not exist/i.test(errorMessage(error))) {
+    return true;
+  }
+  return isMissingContentReceiverError(error.cause);
+}
+
+async function sendContentMessageWithInjectedFrame(tabId, frameId, command, payload) {
+  try {
+    return await sendContentMessage(tabId, frameId, command, payload);
+  } catch (error) {
+    if (!isMissingContentReceiverError(error)) {
+      throw error;
+    }
+    try {
+      await ensureContentScriptInFrame(tabId, frameId);
+    } catch (injectError) {
+      const reinjectError = new Error(
+        `Content script receiver was missing in frame ${isMainFrame(frameId) ? 0 : frameId}, ` +
+        `and reinjection failed: ${errorMessage(injectError)}`
+      );
+      reinjectError.cause = error;
+      throw reinjectError;
+    }
+    return sendContentMessage(tabId, frameId, command, payload);
+  }
+}
+
 async function snapshotTab(tabId, payload) {
   const contentSnapshot = await collectContentSnapshot(tabId, payload);
   const cdpSnapshot = await collectCdpSnapshot(tabId);
@@ -670,11 +716,20 @@ async function collectContentSnapshot(tabId, payload) {
   const frames = await getFrames(tabId);
   const frameResults = [];
   for (const frame of frames) {
-    const result = await sendContentMessage(tabId, frame.frameId, "snapshot", {
-      ...payload,
-      frameId: frame.frameId,
-      frameUrl: frame.url || "",
-    });
+    let result;
+    try {
+      result = await sendContentMessageWithInjectedFrame(tabId, frame.frameId, "snapshot", {
+        ...payload,
+        frameId: frame.frameId,
+        frameUrl: frame.url || "",
+      });
+    } catch (error) {
+      if (isMainFrame(frame.frameId) || !isMissingContentReceiverError(error)) {
+        throw error;
+      }
+      console.warn(`snapshot skipped frame ${frame.frameId} in tab ${tabId}: ${errorMessage(error)}`);
+      continue;
+    }
     if (result) {
       frameResults.push({frame, result});
     }
@@ -700,6 +755,7 @@ async function collectCdpSnapshot(tabId) {
       axTrees.push({frameId, nodes: axTree && Array.isArray(axTree.nodes) ? axTree.nodes : []});
     }
     const domSnapshot = await debuggerSendCommand(tabId, "DOMSnapshot.captureSnapshot", {
+      computedStyles: [],
       includePaintOrder: true,
       includeDOMRects: true,
       includeBlendedBackgroundColors: false,
@@ -1346,19 +1402,11 @@ async function runTargetedCommand(tabId, command, payload) {
 
   const frameId = target && Number.isInteger(target.frameId) ? target.frameId : undefined;
   if (frameId !== undefined || command === "playMedia" || command === "mediaState") {
-    const result = await sendContentMessage(tabId, frameId, command, framedPayload);
-    if (["click", "type", "press"].includes(command)) {
-      await settleTab(tabId);
-    }
-    return result;
+    return sendTargetedContentMessage(tabId, frameId, command, framedPayload);
   }
 
   try {
-    const result = await sendContentMessage(tabId, 0, command, framedPayload);
-    if (["click", "type", "press"].includes(command)) {
-      await settleTab(tabId);
-    }
-    return result;
+    return await sendTargetedContentMessage(tabId, 0, command, framedPayload);
   } catch (firstError) {
     if (!payload || !payload.selector) {
       throw firstError;
@@ -1369,17 +1417,41 @@ async function runTargetedCommand(tabId, command, payload) {
         continue;
       }
       try {
-        const result = await sendContentMessage(tabId, frame.frameId, command, framedPayload);
-        if (["click", "type", "press"].includes(command)) {
-          await settleTab(tabId);
-        }
-        return result;
+        return await sendTargetedContentMessage(tabId, frame.frameId, command, framedPayload);
       } catch (error) {
         // Try the next frame.
       }
     }
     throw firstError;
   }
+}
+
+function errorMessage(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+async function sendTargetedContentMessage(tabId, frameId, command, payload) {
+  try {
+    const result = await sendContentMessageWithInjectedFrame(tabId, frameId, command, payload);
+    if (["click", "type", "press"].includes(command)) {
+      await settleTab(tabId);
+    }
+    return result;
+  } catch (error) {
+    if (isNavigationInterruptedMessage(error) && canCommandNavigate(command)) {
+      await settleTab(tabId);
+      return {ok: true, navigationInterruptedResponse: true};
+    }
+    throw error;
+  }
+}
+
+function isNavigationInterruptedMessage(error) {
+  return /message channel closed|receiving end does not exist/i.test(errorMessage(error));
+}
+
+function canCommandNavigate(command) {
+  return command === "click" || command === "press";
 }
 
 async function resolveClickPoint(tabId, payload) {
