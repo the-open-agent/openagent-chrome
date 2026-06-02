@@ -45,6 +45,31 @@
       Connect
     </button>
 
+    <section class="panel recorder-panel">
+      <div class="recorder-head">
+        <div>
+          <p class="field-label">Manual Action Recorder</p>
+          <p id="recorderDetail" class="status-detail">Record a human demonstration, then edit stable replay steps.</p>
+        </div>
+        <span id="recorderBadge" class="badge">Idle</span>
+      </div>
+      <div class="recorder-actions">
+        <button id="recordToggle" class="secondary-action" type="button">Start Recording</button>
+        <button id="openRecorder" class="ghost-action" type="button">Open Editor</button>
+      </div>
+    </section>
+
+    <section class="panel web-actions-panel">
+      <div class="recorder-head">
+        <div>
+          <p class="field-label">Current Page Actions</p>
+          <p id="webActionsDetail" class="status-detail">Loading saved actions for this site...</p>
+        </div>
+        <button id="refreshWebActions" class="ghost-action compact-action" type="button">Refresh</button>
+      </div>
+      <div id="webActionsList" class="web-actions-list"></div>
+    </section>
+
     <p class="hint">Browser Use mode: <strong>OpenAgent Chrome Extension</strong>. Keep this panel as the link switch.</p>
   </main>
   <script src="popup.js"></script>

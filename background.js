@@ -16,6 +16,18 @@ let reconnectTimer = null;
 let intentionalClose = false;
 let lastPongAt = 0;
 const snapshotTargetsByTab = new Map();
+let recorderState = {
+  active: false,
+  sessionId: "",
+  tabId: 0,
+  loadedAction: null,
+  startUrl: "",
+  lastUrl: "",
+  startedAt: "",
+  stoppedAt: "",
+  steps: [],
+  lastReplay: null,
+};
 
 let currentState = {
   serverUrl: DEFAULT_SERVER_URL,
@@ -96,6 +108,36 @@ function normalizeHttpUrl(serverUrl) {
     url.protocol = "https:";
   }
   return url;
+}
+
+async function openAgentApi(path, options = {}) {
+  const stored = await chrome.storage.local.get(["serverUrl", "token"]);
+  const url = normalizeHttpUrl(stored.serverUrl || currentState.serverUrl);
+  url.pathname = path;
+  for (const [key, value] of Object.entries(options.params || {})) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  const headers = {...(options.headers || {})};
+  if (options.body) {
+    headers["Content-Type"] = headers["Content-Type"] || "application/json";
+  }
+  if (stored.token || currentState.token) {
+    headers.Authorization = headers.Authorization || `Bearer ${stored.token || currentState.token}`;
+  }
+  const response = await fetch(url.toString(), {
+    method: options.method || "GET",
+    credentials: "include",
+    headers: Object.keys(headers).length > 0 ? headers : undefined,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok || !result || result.status !== "ok") {
+    const message = result && result.msg ? result.msg : `HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return result.data;
 }
 
 function normalizeTabId(value) {
@@ -325,6 +367,16 @@ function broadcastStatus() {
   }
 }
 
+function broadcastRecorderStatus() {
+  try {
+    chrome.runtime.sendMessage({type: "recorderStatus", state: getRecorderStatus()}, () => {
+      void chrome.runtime.lastError;
+    });
+  } catch (error) {
+    // No popup is open.
+  }
+}
+
 function getStatus() {
   return {
     serverUrl: currentState.serverUrl,
@@ -335,6 +387,18 @@ function getStatus() {
     connecting: Boolean(socket && socket.readyState === WebSocket.CONNECTING) || currentState.connecting,
     reconnectAttempt: currentState.reconnectAttempt,
     lastError: currentState.lastError,
+  };
+}
+
+function getRecorderStatus() {
+  return {
+    active: Boolean(recorderState.active),
+    sessionId: recorderState.sessionId || "",
+    tabId: recorderState.tabId || 0,
+    loadedAction: recorderState.loadedAction || null,
+    startedAt: recorderState.startedAt || "",
+    stoppedAt: recorderState.stoppedAt || "",
+    stepCount: recorderState.steps.length,
   };
 }
 
@@ -701,6 +765,288 @@ async function sendContentMessageWithInjectedFrame(tabId, frameId, command, payl
       throw reinjectError;
     }
     return sendContentMessage(tabId, frameId, command, payload);
+  }
+}
+
+async function broadcastContentMessage(tabId, command, payload) {
+  await ensureContentScript(tabId, true);
+  const frames = await getFrames(tabId);
+  for (const frame of frames) {
+    try {
+      await sendContentMessage(tabId, frame.frameId, command, payload);
+    } catch (error) {
+      console.warn(`broadcast ${command} failed for frame ${frame.frameId} in tab ${tabId}: ${error.message}`);
+    }
+  }
+}
+
+async function dismissPageInterferenceInTab(tabId) {
+  if (!tabId) {
+    return {dismissed: false};
+  }
+  try {
+    await ensureContentScript(tabId, false);
+    return await sendContentMessage(tabId, 0, "dismissPageInterference", {});
+  } catch (error) {
+    return {dismissed: false, error: error.message || String(error)};
+  }
+}
+
+async function recorderActiveTab() {
+  const [active] = await callbackApi((cb) => chrome.tabs.query({active: true, currentWindow: true}, cb));
+  if (active && !isProtectedTab(active)) {
+    return active;
+  }
+  const fallback = await getActiveNonProtectedTab(0);
+  if (fallback) {
+    return fallback;
+  }
+  throw new Error("No non-protected active tab is available for recording");
+}
+
+async function startRecorder(options = {}) {
+  const tab = await recorderActiveTab();
+  await dismissPageInterferenceInTab(tab.id);
+  recorderState = {
+    active: true,
+    sessionId: `rec_${Date.now()}`,
+    tabId: tab?.id ?? 0,
+    loadedAction: options.action || null,
+    startUrl: tab?.url ?? "",
+    lastUrl: tab?.url ?? "",
+    startedAt: new Date().toISOString(),
+    stoppedAt: "",
+    steps: [],
+    lastReplay: null,
+  };
+  await broadcastContentMessage(tab.id, "setRecorder", {
+    active: true,
+    sessionId: recorderState.sessionId,
+  });
+  broadcastRecorderStatus();
+  return getRecorderStatus();
+}
+
+async function listWebActionsForCurrentTab() {
+  const tab = await recorderActiveTab();
+  const actions = await openAgentApi("/api/get-browser-use-web-actions", {
+    params: {url: tab.url || ""},
+  });
+  return {tab: {id: tab.id, title: tab.title || "", url: tab.url || ""}, actions: Array.isArray(actions) ? actions : []};
+}
+
+async function loadWebActionForEditing(actionGroup, name) {
+  const action = await openAgentApi("/api/get-browser-use-web-action", {
+    params: {action_group: actionGroup || "", name: name || ""},
+  });
+  const tab = await recorderActiveTab().catch(() => null);
+  recorderState = {
+    active: false,
+    sessionId: `edit_${Date.now()}`,
+    tabId: tab?.id ?? recorderState.tabId ?? 0,
+    loadedAction: action,
+    startUrl: action?.url ?? "",
+    lastUrl: action?.url ?? "",
+    startedAt: "",
+    stoppedAt: new Date().toISOString(),
+    steps: Array.isArray(action && action.steps) ? action.steps.map((step) => ({...step})) : [],
+    lastReplay: null,
+  };
+  await openRecorderEditor();
+  broadcastRecorderStatus();
+  return recorderExport();
+}
+
+async function saveWebAction(action) {
+  return openAgentApi("/api/save-browser-use-web-action", {
+    method: "POST",
+    body: action || {},
+  });
+}
+
+async function deleteWebAction(actionGroup, name) {
+  const result = await openAgentApi("/api/delete-browser-use-web-action", {
+    method: "POST",
+    body: {action_group: actionGroup || "", name: name || ""},
+  });
+  return result;
+}
+
+async function stopRecorder() {
+  recorderState.active = false;
+  recorderState.stoppedAt = new Date().toISOString();
+  const tabs = await callbackApi((cb) => chrome.tabs.query({}, cb));
+  for (const tab of tabs || []) {
+    if (!tab || !tab.id || isProtectedTab(tab)) {
+      continue;
+    }
+    try {
+      await broadcastContentMessage(tab.id, "setRecorder", {
+        active: false,
+        sessionId: recorderState.sessionId,
+      });
+    } catch (error) {
+      // Tabs may be closed or unavailable; recording state is already stopped.
+    }
+  }
+  broadcastRecorderStatus();
+  await openRecorderEditor();
+  return getRecorderStatus();
+}
+
+function normalizeRecordedStep(raw, sender) {
+  const step = raw && typeof raw === "object" ? {...raw} : {};
+  step.id = step.id || `step_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  step.tabId = sender && sender.tab && sender.tab.id ? sender.tab.id : step.tabId || 0;
+  step.frameId = sender && Number.isInteger(sender.frameId) ? sender.frameId : step.frameId || 0;
+  step.url = step.url || sender && sender.url || sender && sender.tab && sender.tab.url || "";
+  step.title = step.title || sender && sender.tab && sender.tab.title || "";
+  step.createdAt = step.createdAt || new Date().toISOString();
+  return step;
+}
+
+async function resumeRecorderInTab(tabId, url) {
+  if (!recorderState.active || recorderState.tabId !== tabId) {
+    return;
+  }
+  if (url && url !== recorderState.lastUrl) {
+    appendRecordedStep({
+      kind: "navigate",
+      sessionId: recorderState.sessionId,
+      url,
+      fromUrl: recorderState.lastUrl || "",
+    }, {tab: {id: tabId, url}});
+    recorderState.lastUrl = url;
+  }
+  await broadcastContentMessage(tabId, "setRecorder", {
+    active: true,
+    sessionId: recorderState.sessionId,
+  });
+  await dismissPageInterferenceInTab(tabId);
+}
+
+function appendRecordedStep(raw, sender) {
+  if (!recorderState.active) {
+    return getRecorderStatus();
+  }
+  const incomingSessionId = raw && raw.sessionId || "";
+  if (incomingSessionId !== recorderState.sessionId) {
+    return getRecorderStatus();
+  }
+  const senderTabId = sender && sender.tab && sender.tab.id || 0;
+  if (senderTabId && recorderState.tabId && senderTabId !== recorderState.tabId) {
+    return getRecorderStatus();
+  }
+  const step = normalizeRecordedStep(raw, sender);
+  const last = recorderState.steps[recorderState.steps.length - 1];
+  if (last && last.kind === "type" && step.kind === "type" && last.selector === step.selector) {
+    last.text = step.text;
+    last.value = step.value;
+    last.variable = step.variable || last.variable;
+    last.createdAt = step.createdAt;
+  } else {
+    recorderState.steps.push(step);
+  }
+  broadcastRecorderStatus();
+  return getRecorderStatus();
+}
+
+async function openRecorderEditor() {
+  const tab = await getTab(recorderState.tabId);
+  if (tab && !isProtectedTab(tab)) {
+    try {
+      await ensureContentScript(tab.id, false);
+      await dismissPageInterferenceInTab(tab.id);
+      await sendContentMessage(tab.id, 0, "showRecorderEditor", {});
+      await callbackApi((cb) => chrome.tabs.update(tab.id, {active: true}, cb));
+      if (tab.windowId) {
+        await callbackApi((cb) => chrome.windows.update(tab.windowId, {focused: true}, cb));
+      }
+      return;
+    } catch (error) {
+      // Fall back to the extension page if the current tab cannot host the floating editor.
+    }
+  }
+  const url = chrome.runtime.getURL("recorder.html");
+  const tabs = await callbackApi((cb) => chrome.tabs.query({url}, cb)).catch(() => []);
+  if (tabs && tabs[0] && tabs[0].id) {
+    await callbackApi((cb) => chrome.tabs.update(tabs[0].id, {active: true}, cb));
+    return;
+  }
+  await callbackApi((cb) => chrome.tabs.create({url, active: true}, cb));
+}
+
+function recorderExport() {
+  return {
+    ...getRecorderStatus(),
+    startUrl: recorderState.startUrl || "",
+    actionGroup: recorderState.loadedAction && recorderState.loadedAction.action_group || "",
+    actionName: recorderState.loadedAction && recorderState.loadedAction.name || "",
+    actionDescription: recorderState.loadedAction && (recorderState.loadedAction.description || recorderState.loadedAction.action) || "",
+    lastReplay: recorderState.lastReplay,
+    steps: recorderState.steps.map((step) => ({...step})),
+  };
+}
+
+async function recorderReplayTab() {
+  const recordedTab = await getTab(recorderState.tabId);
+  if (recordedTab && !isProtectedTab(recordedTab)) {
+    await setControlledTab(recordedTab);
+    return recordedTab.id;
+  }
+  const fallback = await recorderActiveTab();
+  await setControlledTab(fallback);
+  return fallback.id;
+}
+
+async function playRecordingSteps(rawSteps) {
+  const steps = Array.isArray(rawSteps) ? rawSteps : [];
+  if (steps.length === 0) {
+    throw new Error("No recorded steps to play");
+  }
+  recorderState.steps = steps.map((step) => ({...step}));
+  let tabId = await recorderReplayTab();
+  const results = [];
+  await setRecorderEditorVisible(tabId, false);
+  try {
+    await dismissPageInterferenceInTab(tabId);
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i] && typeof steps[i] === "object" ? {...steps[i]} : {};
+      const kind = String(step.kind || "").trim();
+      try {
+        await dismissPageInterferenceInTab(tabId);
+        if (kind === "open") {
+          const result = await openUrl({url: step.url || ""});
+          tabId = result && result.tab && Number.isInteger(result.tab.id) ? result.tab.id : await getControlledTabId();
+          await dismissPageInterferenceInTab(tabId);
+          results.push({step: i + 1, kind, result});
+        } else if (kind === "drag_and_drop") {
+          throw new Error("drag_and_drop replay requires browser drag-and-drop action support");
+        } else if (["click", "type", "press"].includes(kind)) {
+          delete step.kind;
+          const result = await runTargetedCommand(tabId, kind, step);
+          results.push({step: i + 1, kind, result});
+        } else {
+          throw new Error(`unsupported kind ${JSON.stringify(kind)}`);
+        }
+      } catch (error) {
+        throw new Error(`replay step ${i + 1} ${kind || "unknown"} failed: ${error.message || String(error)}`);
+      }
+    }
+    recorderState.lastReplay = {ok: true, executed: results.length, completedAt: new Date().toISOString()};
+    await openRecorderEditor();
+  } finally {
+    await dismissPageInterferenceInTab(tabId);
+    await setRecorderEditorVisible(tabId, true);
+  }
+  return {executed: results.length, steps: results};
+}
+
+async function setRecorderEditorVisible(tabId, visible) {
+  try {
+    await sendContentMessage(tabId, 0, "setRecorderEditorVisible", {visible});
+  } catch (error) {
+    // The editor may be open as a standalone extension page or the tab may have navigated.
   }
 }
 
@@ -1564,6 +1910,86 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ok: true, state: getStatus()});
       return;
     }
+    if (message.type === "recorderStatus") {
+      sendResponse({ok: true, state: getRecorderStatus()});
+      return;
+    }
+    if (message.type === "startRecording") {
+      const state = await startRecorder({action: message.action || null});
+      sendResponse({ok: true, state});
+      return;
+    }
+    if (message.type === "stopRecording") {
+      const state = await stopRecorder();
+      sendResponse({ok: true, state});
+      return;
+    }
+    if (message.type === "recordedStep") {
+      const state = appendRecordedStep(message.step, sender);
+      sendResponse({ok: true, state});
+      return;
+    }
+    if (message.type === "getRecording") {
+      sendResponse({ok: true, recording: recorderExport()});
+      return;
+    }
+    if (message.type === "replaceRecording") {
+      recorderState.steps = Array.isArray(message.steps) ? message.steps.map((step) => ({...step})) : recorderState.steps;
+      recorderState.startUrl = message.startUrl ?? recorderState.startUrl ?? "";
+      recorderState.lastUrl = message.startUrl ?? recorderState.lastUrl ?? "";
+      recorderState.loadedAction = message.action || recorderState.loadedAction || null;
+      broadcastRecorderStatus();
+      sendResponse({ok: true, recording: recorderExport()});
+      return;
+    }
+    if (message.type === "openRecorder") {
+      await openRecorderEditor();
+      sendResponse({ok: true, state: getRecorderStatus()});
+      return;
+    }
+    if (message.type === "listWebActionsForCurrentTab") {
+      const result = await listWebActionsForCurrentTab();
+      sendResponse({ok: true, ...result});
+      return;
+    }
+    if (message.type === "editWebAction") {
+      const recording = await loadWebActionForEditing(message.action_group || message.actionGroup, message.name);
+      sendResponse({ok: true, recording});
+      return;
+    }
+    if (message.type === "saveWebAction") {
+      const result = await saveWebAction(message.action || {});
+      sendResponse({ok: true, result});
+      return;
+    }
+    if (message.type === "deleteWebAction") {
+      const result = await deleteWebAction(message.action_group || message.actionGroup, message.name);
+      sendResponse({ok: true, result});
+      return;
+    }
+    if (message.type === "rerecordWebAction") {
+      const action = await openAgentApi("/api/get-browser-use-web-action", {
+        params: {action_group: message.action_group || message.actionGroup || "", name: message.name || ""},
+      });
+      const state = await startRecorder({action});
+      sendResponse({ok: true, state});
+      return;
+    }
+    if (message.type === "playRecording") {
+      try {
+        const result = await playRecordingSteps(message.steps);
+        sendResponse({ok: true, result});
+      } catch (error) {
+        recorderState.lastReplay = {
+          ok: false,
+          error: error.message || String(error),
+          completedAt: new Date().toISOString(),
+        };
+        await openRecorderEditor().catch(() => {});
+        sendResponse({ok: false, error: error.message || String(error)});
+      }
+      return;
+    }
     sendResponse({ok: false, error: `Unsupported popup message: ${message.type}`});
   })().catch((error) => {
     currentState.lastError = error && error.message ? error.message : String(error);
@@ -1576,6 +2002,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   snapshotTargetsByTab.delete(tabId);
   clearControlledTab(tabId).catch(() => {});
+  if (recorderState.tabId === tabId) {
+    recorderState.active = false;
+    recorderState.stoppedAt = new Date().toISOString();
+    broadcastRecorderStatus();
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "complete") {
+    resumeRecorderInTab(tabId, tab && tab.url ? tab.url : changeInfo.url || "").catch((error) => {
+      console.warn(`resume recorder failed for tab ${tabId}: ${error.message}`);
+    });
+  }
+});
+
+chrome.webNavigation.onCommitted.addListener((details) => {
+  if (details.frameId !== 0) {
+    return;
+  }
+  resumeRecorderInTab(details.tabId, details.url || "").catch((error) => {
+    console.warn(`resume recorder on commit failed for tab ${details.tabId}: ${error.message}`);
+  });
+});
+
+chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
+  if (details.frameId !== 0) {
+    return;
+  }
+  resumeRecorderInTab(details.tabId, details.url || "").catch((error) => {
+    console.warn(`resume recorder on domcontentloaded failed for tab ${details.tabId}: ${error.message}`);
+  });
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {

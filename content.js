@@ -5,6 +5,13 @@
   window.__openAgentBrowserBridgeContentLoaded = true;
 
   const maxElements = 140;
+  let recorder = {
+    active: false,
+    sessionId: "",
+    lastPointerDown: null,
+    dragStart: null,
+    lastInputAt: 0,
+  };
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || message.type !== "openagent-command") {
@@ -39,6 +46,20 @@
       return playMedia();
     case "mediaState":
       return {text: mediaState()};
+    case "setRecorder":
+      recorder.active = Boolean(payload.active);
+      recorder.sessionId = payload.sessionId || recorder.sessionId || "";
+      recorder.lastPointerDown = null;
+      recorder.dragStart = null;
+      return {recording: recorder.active};
+    case "recorderState":
+      return {active: recorder.active, sessionId: recorder.sessionId};
+    case "showRecorderEditor":
+      return showRecorderEditor();
+    case "setRecorderEditorVisible":
+      return setRecorderEditorVisible(payload.visible);
+    case "dismissPageInterference":
+      return dismissPageInterference();
     default:
       throw new Error(`Unsupported content command: ${command}`);
     }
@@ -387,7 +408,19 @@
       }
       throw new Error(`Element index/ref ${index} was not found. Call browser_use_snapshot again before reusing indexes`);
     }
-    throw new Error("Missing index, ref, or selector");
+    if (Number.isFinite(payload.x) && Number.isFinite(payload.y)) {
+      const found = document.elementFromPoint(payload.x, payload.y);
+      if (found) {
+        return found;
+      }
+      throw new Error(`Element not found at viewport position ${payload.x},${payload.y}`);
+    }
+    throw new Error("Missing index, ref, selector, or viewport position");
+  }
+
+  function isPositionOnlyTarget(payload) {
+    return Boolean(payload) && !payload.selector && !payload.index && !payload.ref &&
+      Number.isFinite(payload.x) && Number.isFinite(payload.y);
   }
 
   function findComposed(selector) {
@@ -435,6 +468,85 @@
 
   function cssAttr(value) {
     return String(value).replace(/["\\]/g, "\\$&");
+  }
+
+  function absoluteCssPath(el) {
+    const parts = [];
+    let node = el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.documentElement) {
+      let part = tagName(node);
+      if (!part) {
+        break;
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const sameTag = Array.from(parent.children).filter((child) => tagName(child) === part);
+        if (sameTag.length > 1) {
+          part += `:nth-of-type(${sameTag.indexOf(node) + 1})`;
+        }
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+    parts.unshift("html");
+    return parts.join(" > ");
+  }
+
+  function elementRecorderInfo(el, event) {
+    const rect = el.getBoundingClientRect();
+    const point = event ? {
+      x: Math.round(event.clientX),
+      y: Math.round(event.clientY),
+    } : elementCenter(el);
+    return {
+      selector: absoluteCssPath(el),
+      selectorMode: "css",
+      fallback: {
+        mode: "position",
+        x: point.x,
+        y: point.y,
+      },
+      target: {
+        tag: tagName(el),
+        text: accessibleText(el).slice(0, 160),
+        id: el.id || "",
+        name: el.getAttribute("name") || "",
+        role: el.getAttribute("role") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        placeholder: el.getAttribute("placeholder") || "",
+        href: el.href || "",
+        rect: {
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        },
+      },
+    };
+  }
+
+  function variableNameFor(el) {
+    const raw = el.getAttribute("name") || el.id || el.getAttribute("placeholder") || accessibleText(el) || "value";
+    const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    return normalized || "value";
+  }
+
+  function sendRecordedStep(step) {
+    if (!recorder.active) {
+      return;
+    }
+    chrome.runtime.sendMessage({
+      type: "recordedStep",
+      step: {
+        ...step,
+        sessionId: recorder.sessionId,
+        url: window.location.href,
+        title: document.title,
+        createdAt: new Date().toISOString(),
+      },
+    }, () => {
+      void chrome.runtime.lastError;
+    });
   }
 
   async function resolveClickPoint(payload) {
@@ -489,8 +601,10 @@
 
   async function clickElement(payload) {
     const el = resolveTarget(payload);
-    el.scrollIntoView({block: "center", inline: "center"});
-    await sleep(80);
+    if (!isPositionOnlyTarget(payload)) {
+      el.scrollIntoView({block: "center", inline: "center"});
+      await sleep(80);
+    }
     const rect = el.getBoundingClientRect();
     const eventOptions = {
       bubbles: true,
@@ -523,8 +637,10 @@
     const el = resolveTarget(payload);
     const text = String(payload.text || "");
     const clear = payload.clear !== false;
-    el.scrollIntoView({block: "center", inline: "center"});
-    await sleep(80);
+    if (!isPositionOnlyTarget(payload)) {
+      el.scrollIntoView({block: "center", inline: "center"});
+      await sleep(80);
+    }
     focusElement(el);
 
     const tag = tagName(el);
@@ -618,6 +734,225 @@
       el.dispatchEvent(new Event("input", {bubbles: true}));
     }
     el.dispatchEvent(new Event("change", {bubbles: true}));
+  }
+
+  function showRecorderEditor() {
+    const existing = document.getElementById("openagent-recorder-editor");
+    if (existing) {
+      existing.style.display = "block";
+      return {shown: true, reused: true};
+    }
+
+    const shell = document.createElement("div");
+    shell.id = "openagent-recorder-editor";
+    shell.style.cssText = [
+      "position:fixed",
+      "right:24px",
+      "bottom:24px",
+      "width:min(960px,calc(100vw - 48px))",
+      "height:min(720px,calc(100vh - 48px))",
+      "z-index:2147483647",
+      "border:1px solid rgba(24,35,28,.22)",
+      "border-radius:18px",
+      "overflow:hidden",
+      "background:#fff",
+      "box-shadow:0 24px 80px rgba(0,0,0,.28)",
+      "resize:both",
+    ].join(";");
+
+    const header = document.createElement("div");
+    header.style.cssText = [
+      "height:42px",
+      "display:flex",
+      "align-items:center",
+      "justify-content:space-between",
+      "gap:12px",
+      "padding:0 12px 0 14px",
+      "color:#fff",
+      "background:#244734",
+      "font:700 13px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+      "cursor:move",
+      "user-select:none",
+    ].join(";");
+    header.textContent = "OpenAgent Action Recorder";
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "Close";
+    close.style.cssText = [
+      "height:28px",
+      "padding:0 10px",
+      "border:1px solid rgba(255,255,255,.45)",
+      "border-radius:8px",
+      "color:#fff",
+      "background:rgba(255,255,255,.14)",
+      "font:700 12px system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+      "cursor:pointer",
+    ].join(";");
+    close.addEventListener("click", () => {
+      shell.style.display = "none";
+    });
+    header.appendChild(close);
+
+    const frame = document.createElement("iframe");
+    frame.title = "OpenAgent Action Sequence Editor";
+    frame.src = chrome.runtime.getURL("recorder.html?embed=1");
+    frame.style.cssText = [
+      "display:block",
+      "width:100%",
+      "height:calc(100% - 42px)",
+      "border:0",
+      "background:#f5f6f1",
+    ].join(";");
+
+    shell.append(header, frame);
+    document.documentElement.appendChild(shell);
+    makeRecorderEditorDraggable(shell, header);
+    return {shown: true, reused: false};
+  }
+
+  function setRecorderEditorVisible(visible) {
+    const shell = document.getElementById("openagent-recorder-editor");
+    if (!shell) {
+      return {shown: false};
+    }
+    shell.style.display = visible === false ? "none" : "block";
+    return {shown: shell.style.display !== "none"};
+  }
+
+  function dismissPageInterference() {
+    const actions = [];
+    const vignette = dismissGoogleVignette();
+    if (vignette) {
+      actions.push(vignette);
+    }
+    const consent = dismissConsentDialogs();
+    if (consent.length > 0) {
+      actions.push(...consent);
+    }
+    return {dismissed: actions.length > 0, actions};
+  }
+
+  function dismissGoogleVignette() {
+    if (window.location.hash !== "#google_vignette") {
+      return "";
+    }
+    try {
+      history.replaceState(null, document.title, `${window.location.pathname}${window.location.search}`);
+      return "google_vignette_hash";
+    } catch (error) {
+      window.location.hash = "";
+      return "google_vignette_hash";
+    }
+  }
+
+  function dismissConsentDialogs() {
+    const actions = [];
+    const button = findConsentButton();
+    if (button) {
+      button.click();
+      actions.push("consent_button");
+    }
+    removeConsentOverlays(actions);
+    return actions;
+  }
+
+  function findConsentButton() {
+    const selectors = [
+      "button.fc-vendor-preferences-accept-all",
+      "button.fc-cta-consent",
+      "button.fc-cta-do-not-consent",
+      "button.fc-help-dialog-close-button",
+      "[aria-label='全部接受']",
+      "[aria-label='接受全部']",
+      "[aria-label='同意']",
+      "[aria-label='关闭']",
+      "[aria-label='Accept all']",
+      "[aria-label='I agree']",
+      "[aria-label='Close']",
+    ];
+    for (const selector of selectors) {
+      const found = findComposed(selector);
+      if (found && isVisible(found)) {
+        return found;
+      }
+    }
+    return allElements(document).find((el) => {
+      if (!["button", "a"].includes(tagName(el)) || !isVisible(el)) {
+        return false;
+      }
+      return /^(全部接受|接受全部|同意|关闭|accept all|i agree|agree|close)$/i.test(accessibleText(el).trim());
+    }) || null;
+  }
+
+  function removeConsentOverlays(actions) {
+    const selectors = [
+      ".fc-consent-root",
+      ".fc-dialog-overlay",
+      ".fc-dialog-container",
+      "[id^='sp_message_container']",
+      "[class*='cookie'][class*='banner']",
+      "[class*='consent'][class*='banner']",
+    ];
+    for (const selector of selectors) {
+      const nodes = [];
+      try {
+        nodes.push(...document.querySelectorAll(selector));
+      } catch (error) {}
+      for (const node of nodes) {
+        if (node && node.id !== "openagent-recorder-editor") {
+          node.remove();
+          actions.push(`removed:${selector}`);
+        }
+      }
+    }
+    document.documentElement.style.overflow = "";
+    document.body.style.overflow = "";
+  }
+
+  function makeRecorderEditorDraggable(shell, handle) {
+    let drag = null;
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.target && tagName(event.target) === "button") {
+        return;
+      }
+      const rect = shell.getBoundingClientRect();
+      shell.style.left = `${rect.left}px`;
+      shell.style.top = `${rect.top}px`;
+      shell.style.right = "auto";
+      shell.style.bottom = "auto";
+      drag = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        left: rect.left,
+        top: rect.top,
+      };
+      handle.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) {
+        return;
+      }
+      const rect = shell.getBoundingClientRect();
+      const nextLeft = clamp(drag.left + event.clientX - drag.startX, 0, Math.max(0, window.innerWidth - rect.width));
+      const nextTop = clamp(drag.top + event.clientY - drag.startY, 0, Math.max(0, window.innerHeight - 42));
+      shell.style.left = `${Math.round(nextLeft)}px`;
+      shell.style.top = `${Math.round(nextTop)}px`;
+    });
+    handle.addEventListener("pointerup", (event) => {
+      if (drag && event.pointerId === drag.pointerId) {
+        drag = null;
+        try {
+          handle.releasePointerCapture(event.pointerId);
+        } catch (error) {}
+      }
+    });
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
   }
 
   function selectElementContents(el) {
@@ -766,4 +1101,109 @@
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
+
+  function installRecorderListeners() {
+    document.addEventListener("pointerdown", (event) => {
+      if (!recorder.active || event.button !== 0) {
+        return;
+      }
+      const el = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : event.target.parentElement;
+      if (!el) {
+        return;
+      }
+      recorder.lastPointerDown = {
+        el,
+        x: event.clientX,
+        y: event.clientY,
+        time: Date.now(),
+      };
+      recorder.dragStart = recorder.lastPointerDown;
+    }, true);
+
+    document.addEventListener("click", (event) => {
+      if (!recorder.active || event.detail > 1) {
+        return;
+      }
+      const el = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : event.target.parentElement;
+      if (!el) {
+        return;
+      }
+      sendRecordedStep({
+        kind: "click",
+        ...elementRecorderInfo(el, event),
+      });
+    }, true);
+
+    document.addEventListener("dblclick", (event) => {
+      if (!recorder.active) {
+        return;
+      }
+      const el = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : event.target.parentElement;
+      if (!el) {
+        return;
+      }
+      sendRecordedStep({
+        kind: "dblclick",
+        ...elementRecorderInfo(el, event),
+      });
+    }, true);
+
+    document.addEventListener("input", (event) => {
+      if (!recorder.active) {
+        return;
+      }
+      const el = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : null;
+      if (!el || !["input", "textarea", "select"].includes(tagName(el))) {
+        return;
+      }
+      recorder.lastInputAt = Date.now();
+      const value = tagName(el) === "select" ? valueText(el) : el.value || "";
+      sendRecordedStep({
+        kind: "type",
+        text: `{{${variableNameFor(el)}}}`,
+        value,
+        clear: true,
+        ...elementRecorderInfo(el, event),
+      });
+    }, true);
+
+    document.addEventListener("keydown", (event) => {
+      if (!recorder.active) {
+        return;
+      }
+      if (!["Enter", "Tab", "Escape", "Backspace", "Delete"].includes(event.key)) {
+        return;
+      }
+      if (Date.now() - recorder.lastInputAt < 80 && event.key !== "Enter") {
+        return;
+      }
+      sendRecordedStep({
+        kind: "press",
+        key: event.key,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        metaKey: event.metaKey,
+      });
+    }, true);
+
+    document.addEventListener("drop", (event) => {
+      if (!recorder.active || !recorder.dragStart) {
+        return;
+      }
+      const source = recorder.dragStart.el;
+      const target = event.target && event.target.nodeType === Node.ELEMENT_NODE ? event.target : event.target.parentElement;
+      if (!source || !target || source === target) {
+        return;
+      }
+      sendRecordedStep({
+        kind: "drag_and_drop",
+        source: elementRecorderInfo(source, {clientX: recorder.dragStart.x, clientY: recorder.dragStart.y}),
+        target: elementRecorderInfo(target, event),
+      });
+      recorder.dragStart = null;
+    }, true);
+  }
+
+  installRecorderListeners();
 })();

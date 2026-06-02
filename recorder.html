@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>OpenAgent Action Recorder</title>
+  <link rel="stylesheet" href="recorder.css">
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Recorded Web Action</p>
+        <h1>Action Sequence Editor</h1>
+      </div>
+      <div class="top-actions">
+        <button id="play" type="button">Play</button>
+        <button id="saveOpenAgent" type="button">Save to OpenAgent</button>
+        <button id="deleteOpenAgent" class="danger-button" type="button">Delete</button>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <section class="summary">
+      <p id="summaryText">Loading recorded steps...</p>
+      <p class="hint">Edit selectors, switch to position fallback, or replace typed values with variables before saving as a web action.</p>
+    </section>
+
+    <section class="step-toolbar">
+      <span>Add step</span>
+      <button class="ghost-button" data-add-step="open" type="button">Open</button>
+      <button class="ghost-button" data-add-step="click" type="button">Click</button>
+      <button class="ghost-button" data-add-step="type" type="button">Type</button>
+      <button class="ghost-button" data-add-step="press" type="button">Press</button>
+      <button class="ghost-button" data-add-step="drag_and_drop" type="button">Drag</button>
+    </section>
+
+    <section id="steps" class="steps"></section>
+
+    <section class="save-panel">
+      <h2>OpenAgent Save Target</h2>
+      <div class="save-grid">
+        <label>Action group
+          <input id="actionGroup" placeholder="studygolang">
+        </label>
+        <label>Action name
+          <input id="actionName" placeholder="login">
+        </label>
+        <label class="wide">Description
+          <input id="actionDescription" placeholder="What this action does and where it stops">
+        </label>
+      </div>
+      <p id="saveStatus" class="save-status">Play the action once, then save it into OpenAgent.</p>
+    </section>
+
+  </main>
+  <script src="recorder.js"></script>
+</body>
+</html>
